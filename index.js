@@ -94,3 +94,6 @@ app.post("/generate", async (req, res) => {
     }
   }
 });
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`si-v5-worker listening on ${PORT}`));
