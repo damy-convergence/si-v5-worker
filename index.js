@@ -1,83 +1,109 @@
+// index.js — Railway worker (si-v5-worker)
+// Receives a dispatch from Base44, runs Anthropic synthesis (non-streaming),
+// and POSTs the result back to the callback_url Base44 provided.
 import express from "express";
-import Anthropic from "@anthropic-ai/sdk";
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const WORKER_SECRET = process.env.WORKER_SECRET;
-const CALLBACK_URL = process.env.BASE44_CALLBACK_URL; // fallback only
+const WORKER_SECRET = process.env.RAILWAY_WORKER_SECRET;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-app.get("/", (_req, res) => res.status(200).send("v5 worker alive"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/generate", (req, res) => {
+app.post("/generate", async (req, res) => {
+  // 1. Authenticate the incoming dispatch from Base44.
   if (req.headers["x-worker-secret"] !== WORKER_SECRET) {
-    return res.status(401).json({ error: "unauthorized" });
+    return res.status(403).json({ error: "forbidden" });
   }
 
-  // callback_url is now sent by Base44 in the payload. Prefer it over the env var
-  // so we always post back to the correct app domain.
-  const { request_id, model, resolved_prompt, output_schema, callback_url } = req.body || {};
-  if (!request_id || !resolved_prompt) {
-    return res.status(400).json({ error: "missing request_id or resolved_prompt" });
+  const { request_id, callback_url, model, resolved_prompt, tools, tool_choice } = req.body || {};
+  if (!request_id || !callback_url || !resolved_prompt) {
+    return res.status(400).json({ error: "missing request_id, callback_url, or resolved_prompt" });
   }
 
-  const callbackUrl = callback_url || CALLBACK_URL;
-  if (!callbackUrl) {
-    return res.status(400).json({ error: "no callback_url provided and BASE44_CALLBACK_URL not set" });
-  }
-
+  // 2. ACK immediately so Base44 doesn't wait (fire-and-forget async pattern).
   res.status(202).json({ accepted: true, request_id });
 
-  synthesizeAndCallback({ request_id, model, resolved_prompt, output_schema, callbackUrl })
-    .catch((err) => {
-      console.error(`[${request_id}] synthesis failed:`, err.message);
-      postCallback(callbackUrl, { request_id, success: false, error: err.message });
+  const startedAt = Date.now();
+
+  // 3. Do the heavy work AFTER responding.
+  try {
+    const anthropicBody = {
+      model: model || "claude-sonnet-4-6",
+      max_tokens: 4096,
+      stream: false, // ← NON-STREAMING: single JSON response, no SSE parsing
+      messages: [{ role: "user", content: resolved_prompt }],
+    };
+    // If Base44 sent a forced-tool JSON schema, pass it through.
+    if (tools) anthropicBody.tools = tools;
+    if (tool_choice) anthropicBody.tool_choice = tool_choice;
+
+    const anthropicResp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01", // ← required version header
+      },
+      body: JSON.stringify(anthropicBody),
     });
+
+    if (!anthropicResp.ok) {
+      const errText = await anthropicResp.text();
+      throw new Error(`Anthropic ${anthropicResp.status}: ${errText.substring(0, 500)}`);
+    }
+
+    const data = await anthropicResp.json(); // ← read once, not a stream
+
+    // 4. Extract the script. Tool-forced output lands in a tool_use block;
+    //    plain text lands in a text block.
+    let script;
+    const toolBlock = (data.content || []).find((b) => b.type === "tool_use");
+    if (toolBlock) {
+      script = toolBlock.input; // already a parsed object
+    } else {
+      const textBlock = (data.content || []).find((b) => b.type === "text");
+      script = JSON.parse(textBlock?.text || "{}");
+    }
+
+    // 5. Callback to Base44 — WITH the shared secret header.
+    await fetch(callback_url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-worker-secret": WORKER_SECRET, // ← REQUIRED so receiveRailwayScript accepts it
+      },
+      body: JSON.stringify({
+        request_id,
+        success: true,
+        script,
+        usage: data.usage,
+        timing_ms: Date.now() - startedAt,
+      }),
+    });
+  } catch (err) {
+    // 6. On failure, still call back so the request doesn't stay stuck in "processing".
+    console.error(`[generate] request_id=${request_id} failed:`, err.message);
+    try {
+      await fetch(callback_url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-worker-secret": WORKER_SECRET, // ← secret header on failure callback too
+        },
+        body: JSON.stringify({
+          request_id,
+          success: false,
+          error: err.message,
+          timing_ms: Date.now() - startedAt,
+        }),
+      });
+    } catch (cbErr) {
+      console.error(`[generate] callback failed for request_id=${request_id}:`, cbErr.message);
+    }
+  }
 });
 
-async function synthesizeAndCallback({ request_id, model, resolved_prompt, output_schema, callbackUrl }) {
-  const started = Date.now();
-
-  const message = await anthropic.messages.create({
-    model: model || "claude-opus-4-20250514",
-    max_tokens: 4096,
-    tools: [{
-      name: "emit_coaching_message",
-      description: "Return the structured daily coaching message.",
-      input_schema: output_schema || { type: "object", properties: {}, additionalProperties: true }
-    }],
-    tool_choice: { type: "tool", name: "emit_coaching_message" },
-    messages: [{ role: "user", content: resolved_prompt }]
-  });
-
-  const toolUse = message.content.find((c) => c.type === "tool_use");
-  if (!toolUse) throw new Error("No tool_use block in Anthropic response");
-
-  await postCallback(callbackUrl, {
-    request_id,
-    success: true,
-    script: toolUse.input,
-    usage: message.usage,
-    timing_ms: Date.now() - started
-  });
-}
-
-async function postCallback(callbackUrl, payload) {
-  const resp = await fetch(callbackUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-worker-secret": WORKER_SECRET
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!resp.ok) {
-    const body = await resp.text();
-    console.error(`[${payload.request_id}] callback rejected ${resp.status}: ${body}`);
-  }
-}
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`v5 worker listening on ${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`si-v5-worker listening on ${PORT}`));
